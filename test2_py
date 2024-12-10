@@ -1,0 +1,544 @@
+from langchain_ollama import OllamaLLM
+from langchain_community.utilities.sql_database import SQLDatabase
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from sqlalchemy import create_engine
+from sqlalchemy import text
+import requests
+
+# Set up database connection to the new isolated database
+engine = create_engine('postgresql+psycopg2://postgres@localhost:5432/FPL')
+
+# Create a SQLDatabase object
+db = SQLDatabase(engine)
+
+from typing import Any
+
+from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
+from langgraph.prebuilt import ToolNode
+
+def create_tool_node_with_fallback(tools: list) -> RunnableWithFallbacks[Any, dict]:
+    """
+    Create a ToolNode with a fallback to handle errors and surface them to the agent.
+    """
+    try:
+        tool_node = ToolNode(tools)
+        return tool_node.with_fallbacks(
+            [RunnableLambda(handle_tool_error)], 
+            exception_key="error"
+        )
+    except Exception as e:
+        print(f"Error creating tool node: {e}")
+        # Return a fallback node that always raises an error
+        return RunnableLambda(lambda _: {"messages": [AIMessage(content=f"Tool node creation failed: {e}")]})
+
+
+def handle_tool_error(state) -> dict:
+    error = state.get("error")
+    
+    # Check if the last message is an AIMessage or ToolMessage
+    last_message = state["messages"][-1]
+    
+    # If it's a ToolMessage or AIMessage without tool_calls, create a generic error message
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\nPlease fix your query.",
+                tool_call_id="generic_error"
+            )
+        ]
+    }
+
+# Configure LLM
+llm = OllamaLLM(
+    model="llama3.2",
+    base_url="http://localhost:11434",
+    temperature=0.7,
+    top_p=0.9,
+    format='json',
+    prompt_template="""You are a helpful assistant interacting with the FPL database which contains the following tables: 
+      1) clubs: containing a list of clubs (one column name with the name of the clubs)
+    Example: "Arsenal"
+    "Aston Villa"
+    "Bournemouth"
+    "Brentford"
+    "Brighton"
+    "Burnley"
+    2) fixtures_23_24: a table of the different games and info about each game
+    GW	game_id	kickoff_time	team_a	team_a_score	team_h	team_h_score	team_h_difficulty	team_a_difficulty
+    1	1	2023-08-11T19:00:00Z	13	3	6	0	5	2
+    1	2	2023-08-12T12:00:00Z	16	1	1	2	2	5
+    1	3	2023-08-12T14:00:00Z	19	1	3	1	2	2
+    3) merged_gws_23_24: stats of each player depending on every gameweek
+    player_name	position	team	xP	assists	bonus	bps	clean_sheets	creativity	element	expected_assists	expected_goal_involvements	expected_goals	expected_goals_conceded	fixture	goals_conceded	goals_scored	ict_index	influence	kickoff_time	minutes	opponent_team	own_goals	penalties_missed	penalties_saved	red_cards	round	saves	selected	starts	team_a_score	team_h_score	threat	total_points	transfers_balance	transfers_in	transfers_out	value	was_home	yellow_cards	GW
+    Femi Seriki	DEF	Sheffield Utd	0.5	0	0	0	0	0.0	653	0.00	0.00	0.00	0.00	7	0	0	0.0	0.0	2023-08-12T14:00:00Z	0	8	0	0	0	0	1	0	0	0	1	0	0.0	0	0	0	0	40	TRUE	0	1
+    Jack Hinshelwood	MID	Brighton	1.5	0	0	0	0	0.0	621	0.00	0.00	0.00	0.00	4	0	0	0.0	0.0	2023-08-12T14:00:00Z	0	12	0	0	0	0	1	0	822	0	1	4	0.0	0	0	0	0	45	TRUE	0	1
+    Jadon Sancho	MID	Man Utd	3.0	0	0	4	0	11.3	397	0.05	0.05	0.00	1.08	10	0	0	2.3	3.8	2023-08-14T19:00:00Z	22	20	0	0	0	0	1	0	83993	0	0	1	8.0	1	0	0	0	70	TRUE	0	1
+    4) teams_23_24: a table of the clubs and some statistics about their overall strength
+    team_id	name	short_name	strength	strength_overall_home	strength_overall_away	strength_attack_home	strength_attack_away	strength_defence_home	strength_defence_away
+    1	Arsenal	ARS	5	1350	1365	1370	1370	1330	1360
+    2	Aston Villa	AVL	4	1160	1285	1140	1220	1180	1350
+    3	Bournemouth	BOU	3	1100	1100	1055	1130	1145	1075
+    You must only interact with these tables. 
+    Always respond in this JSON format:
+    {{
+        "Action": "<action_name>",
+        "Action Input": "<input_value>"
+    }}
+    If you cannot process the query, return:
+    {{
+        "Action": "None",
+        "Action Input": "I cannot process this query."
+    }}
+    """
+)
+
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain_openai import ChatOpenAI
+
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+tools = toolkit.get_tools()
+
+list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
+get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
+
+
+from langchain_core.tools import tool
+
+
+@tool
+def db_query_tool(query: str) -> str:
+    """
+    Execute a SQL query against the database and get back the result.
+    If the query is not correct, an error message will be returned.
+    If an error is returned, rewrite the query, check the query, and try again.
+    """
+    result = db.run_no_throw(query)
+    if not result:
+        return "Error: Query failed. Please rewrite your query and try again."
+    return result
+
+
+print(db_query_tool.invoke("SELECT * FROM merged_gws_23_24 LIMIT 10;"))
+
+from langchain_ollama import OllamaLLM
+from langchain_community.utilities.sql_database import SQLDatabase
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from sqlalchemy import create_engine, text
+from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
+from langgraph.prebuilt import ToolNode
+from typing import Any
+import json
+import traceback
+
+# Query checking and execution
+def check_and_execute_query(query):
+    prompt = f"""You are a SQL expert checking a database query.
+
+Analyze the following SQL query: {query}
+
+Requirements for response:
+1. If the query is valid, return a JSON with:
+   {{"Action": "Correctly formatted query", "Action Input": "{query}"}}
+2. If the query has issues, return a detailed JSON explaining the problems:
+   {{"Action": "Incorrectly formatted query", "Explanation": "Specific error details"}}
+
+Your response must be in strict JSON format."""
+
+    try:
+        print("Sending query to LLM...")
+        response = llm(prompt)
+        print("Raw LLM Response:", response)
+
+        # Parse the LLM's response
+        parsed_response = json.loads(response)
+
+        if parsed_response.get('Action') == 'Correctly formatted query':
+            query_to_execute = parsed_response.get('Action Input', '')
+            if query_to_execute:
+                return db_query_tool(query_to_execute)
+            else:
+                return "Unable to process query"
+        elif parsed_response.get('Action') == 'Incorrectly formatted query':
+            explanation = parsed_response.get('Explanation', 'No explanation provided')
+            print(f"Query Formatting Issue: {explanation}")
+            return f"Query Formatting Error: {explanation}"
+        else:
+            return "Unable to process query"
+
+    except json.JSONDecodeError:
+        print("JSON Parsing Error. Full response:")
+        print(response)
+        return "Error: Could not parse LLM response as JSON"
+    except Exception as e:
+        print("Unexpected error:")
+        traceback.print_exc()
+        return f"Unexpected error: {str(e)}"
+
+try:
+    query = "SELECT * FROM clubs;"
+    result = check_and_execute_query(query)
+    print("Final Result:", result)
+except Exception as e:
+    print(f"Error in query chain: {e}")
+
+
+# Typing and LangGraph imports
+from typing import Annotated, Literal, Any
+from typing_extensions import TypedDict
+from langchain_core.messages import AIMessage, ToolMessage, AnyMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+from langchain_core.messages import ToolMessage, AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
+from langgraph.prebuilt import ToolNode
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import add_messages
+import json
+import traceback
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
+
+# LangGraph imports
+from langgraph.graph import END, StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+
+from langchain_core.runnables.config import RunnableConfig
+
+# Set a higher recursion limit
+RunnableConfig.recursion_limit = 50
+
+# Define the state for the agent
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+# Define a new graph
+workflow = StateGraph(State)
+
+
+# Add a node for the first tool call
+def first_tool_call(state: State) -> dict[str, list[AIMessage]]:
+    return {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "sql_db_list_tables",
+                        "args": {},
+                        "id": "tool_abcd123",
+                    }
+                ],
+            )
+        ]
+    }
+
+def choose_the_right_DDL_table(state: State) -> dict[str, list[AIMessage]]:
+    """
+    A node function to choose the relevant tables based on the user's question.
+    """
+    last_user_message = state["messages"][-1].content
+    prompt = f"""
+    Determine which table is most relevant to the question: "{last_user_message}"
+    
+    Available tables:
+    1) clubs
+    2) clean_players_23_24
+    3) fixtures_23_24
+    4) merged_gws_23_24
+    5) teams_23_24
+
+    Respond with the MOST RELEVANT table name or 'None' if unsure.
+    """
+    
+    try:
+        response = llm(prompt)
+        response_data = json.loads(response)
+        
+        table_name = response_data.get('Action Input', 'None')
+        
+        if table_name != 'None':
+            return {
+                "messages": [
+                    AIMessage(content=f"Relevant table identified: {table_name}")
+                ]
+            }
+        else:
+            return {
+                "messages": [
+                    AIMessage(content="Unable to identify a relevant table.")
+                ]
+            }
+    except Exception as e:
+        return {
+            "messages": [
+                AIMessage(content=f"Error in table selection: {str(e)}")
+            ]
+        }
+
+def generate_query(state: State) -> dict[str, list[AIMessage]]:
+    """
+    A node function to generate a SQL query based on the user's input and schema.
+    """
+    last_user_message = state["messages"][-1].content
+    prompt = f"""
+    You are a SQL expert interacting with a database that contains the following schema:
+
+    1) clubs: containing a list of clubs (one column name with the name of the clubs)
+    2) clean_players_23_24: full stats of the season for each player
+    3) fixtures_23_24: a table of the different games and info about each game
+    4) merged_gws_23_24: stats of each player depending on every gameweek
+    5) teams_23_24: a table of the clubs and some statistics about their overall strength
+
+    Your task:
+    - Generate a syntactically correct PostgreSQL query that answers the user's question: "{last_user_message}"
+    - Include any relevant notes about your query logic
+
+    Respond in this exact JSON format:
+    {{
+      "query": "Generated SQL query here",
+      "notes": "Explanation of the query logic"
+    }}
+
+    If you cannot generate a query, respond:
+    {{
+      "error": "Explanation of why the query cannot be generated"
+    }}
+    """
+    try:
+        print("Sending query generation request to LLM...")
+        response = llm(prompt)
+        print("Raw LLM Response:", response)
+
+        response_data = json.loads(response)
+        if "query" in response_data:
+            query_to_execute = response_data["query"]
+            return {
+                "messages": [
+                    AIMessage(
+                        content=f"Query generated successfully: {query_to_execute}",
+                        additional_kwargs={"query": query_to_execute}
+                    )
+                ]
+            }
+        elif "error" in response_data:
+            error_message = response_data["error"]
+            return {
+                "messages": [
+                    AIMessage(content=f"Query generation failed: {error_message}")
+                ]
+            }
+        else:
+            return {
+                "messages": [
+                    AIMessage(content="Unexpected response format from the LLM.")
+                ]
+            }
+    except json.JSONDecodeError:
+        return {
+            "messages": [
+                AIMessage(content="Error: Could not parse LLM response as JSON.")
+            ]
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "messages": [
+                AIMessage(content=f"Unexpected error: {str(e)}")
+            ]
+        }
+
+def model_check_query(state: State) -> dict[str, list[AIMessage]]:
+    """
+    Validate the generated query using the LLM.
+    """
+    last_message = state["messages"][-1]
+    query = last_message.additional_kwargs.get("query", "")
+    
+    prompt = f"""
+    Validate the following SQL query: "{query}"
+    
+    Ensure it:
+    - Is syntactically correct
+    - Uses appropriate tables
+    - Will return meaningful results
+    
+    Respond in JSON:
+    {{
+      "valid": true/false,
+      "reason": "Explanation if invalid"
+    }}
+    """
+    
+    try:
+        response = llm(prompt)
+        response_data = json.loads(response)
+        
+        if response_data.get("valid", False):
+            return {
+                "messages": [
+                    AIMessage(content="Query validation passed.")
+                ]
+            }
+        else:
+            return {
+                "messages": [
+                    AIMessage(content=f"Query validation failed: {response_data.get('reason', 'Unknown reason')}")
+                ]
+            }
+    except Exception as e:
+        return {
+            "messages": [
+                AIMessage(content=f"Error in query validation: {str(e)}")
+            ]
+        }
+
+def execute_query_node(state: State) -> dict[str, list[AnyMessage]]:
+    last_message = state["messages"][-1]
+    
+    # Extract the query from additional_kwargs or look for a generated query
+    query = None
+    if hasattr(last_message, 'additional_kwargs'):
+        query = last_message.additional_kwargs.get("query")
+    
+    # Fallback: look for a query in previous messages
+    if not query:
+        for msg in reversed(state["messages"]):
+            if hasattr(msg, 'additional_kwargs') and 'query' in msg.additional_kwargs:
+                query = msg.additional_kwargs['query']
+                break
+    
+    if query:
+        try:
+            # Use the db_query_tool to execute the query
+            result = db_query_tool(query)
+            
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=str(result),
+                        name="db_query_tool",
+                        tool_call_id="query_execution"
+                    )
+                ]
+            }
+        except Exception as e:
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=f"Error executing query: {str(e)}",
+                        name="db_query_tool",
+                        tool_call_id="query_execution_error"
+                    )
+                ]
+            }
+    
+    return {
+        "messages": [
+            ToolMessage(
+                content="No query found to execute",
+                name="db_query_tool",
+                tool_call_id="no_query"
+            )
+        ]
+    }
+
+def should_continue(state: State) -> Literal[END, "generate_query", "execute_query"]:
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # If query has been validated, move to execute
+    if isinstance(last_message, AIMessage) and "Query validation passed" in last_message.content:
+        return "execute_query"
+    
+    # If there's a successful query generation
+    if isinstance(last_message, AIMessage) and "Query generated successfully" in last_message.content:
+        return "execute_query"
+    
+    # If query execution fails, try generating a new query
+    if isinstance(last_message, ToolMessage):
+        if "Error" in last_message.content or "failed" in last_message.content.lower():
+            return "generate_query"
+        return END
+    
+    # Default: try to generate a query
+    return "generate_query"
+
+# Add nodes to the workflow
+workflow.add_node("first_tool_call", first_tool_call)
+workflow.add_node("list_tables_tool", create_tool_node_with_fallback([list_tables_tool]))
+workflow.add_node("choose_the_right_DDL_table", choose_the_right_DDL_table)
+workflow.add_node("get_schema_tool", create_tool_node_with_fallback([get_schema_tool]))
+workflow.add_node("generate_query", generate_query)
+workflow.add_node("correct_query", model_check_query)
+workflow.add_node("execute_query", execute_query_node)
+
+# Specify the workflow edges
+workflow.add_edge(START, "first_tool_call")
+workflow.add_edge("first_tool_call", "list_tables_tool")
+workflow.add_edge("list_tables_tool", "choose_the_right_DDL_table")
+workflow.add_edge("choose_the_right_DDL_table", "get_schema_tool")
+workflow.add_edge("get_schema_tool", "generate_query")
+
+workflow.add_conditional_edges(
+    "generate_query",
+    should_continue,
+    {
+        "generate_query": "generate_query",
+        "execute_query": "correct_query",
+        END: END
+    }
+)
+
+workflow.add_conditional_edges(
+    "correct_query",
+    should_continue,
+    {
+        "generate_query": "generate_query",
+        "execute_query": "execute_query",
+        END: END
+    }
+)
+
+workflow.add_edge("execute_query", END)
+
+# Compile the workflow into a runnable
+app = workflow.compile()
+
+import traceback
+import sys
+
+def run_query(query):
+    try:
+        inputs = {"messages": [HumanMessage(content=query)]}
+        result = app.invoke(inputs)
+        return result
+    except Exception as e:
+        print("Unexpected error occurred:")
+        print(f"Error Type: {type(e)}")
+        print(f"Error Message: {str(e)}")
+        traceback.print_exc(file=sys.stdout)
+        return None
+    
+# Debug helper function
+def print_messages(result):
+    print("\n--- Message History ---")
+    for msg in result['messages']:
+        print(f"Type: {type(msg)}")
+        print(f"Content: {msg.content}")
+        print(f"Additional Info: {getattr(msg, 'additional_kwargs', 'N/A')}")
+        print("---")
+
+
+try:
+    result = run_query("What is the id number of Arsenal?")
+    if result:
+        print_messages(result)
+except Exception as e:
+    print(f"Error: {e}")
+    traceback.print_exc()
